@@ -4,9 +4,9 @@ from sklearn.preprocessing import StandardScaler  # or MinMaxScaler
 from scipy import stats
 import pandas as pd
 import numpy as np
-from sklearn.model_selection import train_test_split, GridSearchCV, cross_val_score
+from sklearn.model_selection import train_test_split, GridSearchCV, cross_val_score, TimeSeriesSplit
 from sklearn.preprocessing import OneHotEncoder
-from sklearn.linear_model import LinearRegression, LogisticRegression
+from sklearn.linear_model import LogisticRegression, LinearRegression, Lasso
 from sklearn.metrics import mean_squared_error, roc_auc_score, make_scorer
 from catboost import CatBoostClassifier, CatBoostRegressor
 from lightgbm import LGBMClassifier, LGBMRegressor
@@ -15,6 +15,10 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.ensemble import VotingClassifier, VotingRegressor
 import category_encoders as ce
+from sklearn.pipeline import make_pipeline
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.metrics import roc_curve, auc
 
 
 # Detailed and Quick parameter grids for classification
@@ -478,7 +482,7 @@ def impute_outliers(df, method_dict=None, k_neighbors=10, drop_outlier_cols=True
     return df_copy
 
 
-def feature_selection(df, target_column):
+def univariate_feature_selection(df, target_column):
     df = df.copy()
     results = {}
 
@@ -566,13 +570,137 @@ def encode_categorical_features(X_train, X_test, one_hot_cols, target_encode_col
 
     return X_train, X_test
 
-def train_baseline_model(X_train, y_train, is_classification):
+
+def train_baseline_model(X_train, y_train, is_classification=True, l1_param=1.0):
+    """
+    Train a baseline model with optional L1 regularization and scaling.
+
+    Parameters:
+    - X_train: Features for training
+    - y_train: Target variable for training
+    - is_classification: Boolean indicating if the task is classification (True) or regression (False)
+    - l1_param: Regularization strength for L1 (default is 1.0, set to 0 for no regularization)
+
+    Returns:
+    - model: Trained model
+    """
     if is_classification:
-        model = LogisticRegression()
+        if l1_param > 0:
+            model = LogisticRegression(penalty='l1', C=1 / l1_param, solver='liblinear')
+        else:
+            model = LogisticRegression(penalty='none')  # No regularization
     else:
-        model = LinearRegression()
-    model.fit(X_train, y_train)
-    return model
+        if l1_param > 0:
+            model = Lasso(alpha=l1_param)  # Use Lasso for regression with L1 regularization
+        else:
+            model = LinearRegression()  # No regularization for Linear Regression
+
+    # Create a pipeline with scaling and the model
+    pipeline = make_pipeline(StandardScaler(), model)
+
+    # Fit the pipeline
+    pipeline.fit(X_train, y_train)
+
+    return pipeline
+
+def baseline_coefficient(pipeline):
+    # Access the model coefficients
+    if isinstance(pipeline.named_steps['logisticregression'], LogisticRegression):
+        model = pipeline.named_steps['logisticregression']
+    elif isinstance(pipeline.named_steps['lasso'], Lasso):
+        model = pipeline.named_steps['lasso']
+    else:
+        model = pipeline.named_steps['linearregression']
+
+    # Get coefficients
+    coefficients = model.coef_
+    intercept = model.intercept_
+
+    print("Coefficients:", coefficients)
+    print("Intercept:", intercept)
+    return coefficients, intercept
+
+
+def performance_report(y_test, y_pred, is_classification):
+    if is_classification:
+        # Convert probabilities to class predictions
+        y_pred_class = (y_pred[:, 1] >= 0.5).astype(int)  # Assuming binary classification
+
+        # Calculate accuracy
+        accuracy = accuracy_score(y_test, y_pred_class)
+        print(f'Accuracy: {accuracy:.2f}')
+
+        # Classification report
+        cl_report = classification_report(y_test, y_pred_class)
+        print('Classification Report:\n', cl_report)
+
+        # Confusion matrix
+        conf_matrix = confusion_matrix(y_test, y_pred_class)
+        print('Confusion Matrix:\n', conf_matrix)
+
+        return accuracy, cl_report, conf_matrix
+
+    else:
+        # Calculate regression metrics
+        mae = mean_absolute_error(y_test, y_pred)
+        mse = mean_squared_error(y_test, y_pred)
+        r2 = r2_score(y_test, y_pred)
+
+        print(f'Mean Absolute Error: {mae:.2f}')
+        print(f'Mean Squared Error: {mse:.2f}')
+        print(f'R-squared: {r2:.2f}')
+
+        return mae, mse, r2
+
+
+def performance_visualize(y_test, y_pred, is_classification):
+    if is_classification:
+        # Confusion Matrix
+        plt.figure(figsize=(8, 6))
+        conf_matrix = confusion_matrix(y_test, y_pred.argmax(axis=1))  # Use argmax for class predictions
+        sns.heatmap(conf_matrix, annot=True, fmt='d', cmap='Blues')
+        plt.xlabel('Predicted')
+        plt.ylabel('Actual')
+        plt.title('Confusion Matrix')
+        plt.show()
+
+        # Calculate ROC curve
+        fpr, tpr, _ = roc_curve(y_test, y_pred[:, 1])  # Use probabilities for positive class
+        roc_auc = auc(fpr, tpr)
+
+        plt.figure()
+        plt.plot(fpr, tpr, color='blue', lw=2, label='ROC curve (area = %0.2f)' % roc_auc)
+        plt.plot([0, 1], [0, 1], color='red', lw=2, linestyle='--')
+        plt.xlim([0.0, 1.0])
+        plt.ylim([0.0, 1.05])
+        plt.xlabel('False Positive Rate')
+        plt.ylabel('True Positive Rate')
+        plt.title('Receiver Operating Characteristic')
+        plt.legend(loc="lower right")
+        plt.show()
+
+    else:
+        # Predicted vs Actual
+        plt.figure(figsize=(8, 6))
+        plt.scatter(y_test, y_pred, alpha=0.6)
+        plt.plot([y_test.min(), y_test.max()], [y_test.min(), y_test.max()], 'r--')
+        plt.xlabel('Actual')
+        plt.ylabel('Predicted')
+        plt.title('Actual vs. Predicted')
+        plt.show()
+
+        # Residuals
+        residuals = y_test - y_pred
+
+        plt.figure(figsize=(8, 6))
+        plt.scatter(y_pred, residuals, alpha=0.6)
+        plt.axhline(0, color='red', linestyle='--')
+        plt.xlabel('Predicted Values')
+        plt.ylabel('Residuals')
+        plt.title('Residuals vs. Predicted Values')
+        plt.show()
+
+    return
 
 
 def evaluate_baseline_model(model, X_train, y_train, X_test, y_test, is_classification):
@@ -604,8 +732,12 @@ def log_loss_function(y_true, y_pred):
 
 
 # Step 3: Define and Optimize Ensemble Models with Two Hyperparameter Sets
-def optimize_model(model, param_grid, X_train, y_train, is_classification):
-    grid_search = GridSearchCV(model, param_grid, cv=3,
+def optimize_model(model, param_grid, X_train, y_train, is_classification, tscv = False):
+    if tscv:
+        cvs = TimeSeriesSplit(n_splits=3)
+    else:
+        cvs = 3
+    grid_search = GridSearchCV(model, param_grid, cv=cvs,
                                scoring='neg_mean_squared_error' if not is_classification else 'roc_auc', n_jobs=-1,
                                verbose=10)
     grid_search.fit(X_train, y_train)
@@ -613,10 +745,11 @@ def optimize_model(model, param_grid, X_train, y_train, is_classification):
 
 
 # Function to optimize models with a specified hyperparameter set
-def optimize_all_models(models, param_set, X_train, y_train, is_classification):
+def optimize_all_models(models, param_set, X_train, y_train, is_classification, tscv = False):
     best_models = {}
     for model_name, (model, params) in models.items():
-        best_model, best_params = optimize_model(model, params[param_set], X_train, y_train, is_classification)
+        best_model, best_params = optimize_model(model, params[param_set], X_train, y_train, is_classification,
+                                                 tscv = tscv)
         best_models[model_name] = best_model
         print(f'Best {model_name} Parameters ({param_set}): {best_params}')
     return best_models
@@ -635,8 +768,8 @@ def ensemble_predict(models, X, is_classification):
     return ensemble_preds
 
 # Step 5: Evaluate Ensemble Model and Individual Models
-def evaluate_models(best_models, y_train, y_test, train_ensemble_preds, test_ensemble_preds,
-                    X_train_encoded, X_test_encoded, is_classification):
+def evaluate_multi_models(best_models, y_train, y_test, train_ensemble_preds, test_ensemble_preds,
+                          X_train_encoded, X_test_encoded, is_classification):
     results = {}
 
     # Evaluate ensemble model
@@ -743,3 +876,106 @@ def identify_outliers(df, visualize=False):
             plt.show()
 
     return df_outliers
+
+
+def evaluate_model(model, X_train, y_train, X_test, y_test, is_classification):
+    model.fit(X_train, y_train)  # Suppress output for quicker runs
+    y_pred = model.predict(X_test)
+    return accuracy_score(y_test, y_pred) if is_classification else np.sqrt(mean_squared_error(y_test, y_pred))
+
+
+def create_param_grid(is_classification, unique_classes):
+    common_params = {
+        'learning_rate': 0.1,
+        'num_leaves': 31,
+        'max_depth': -1,
+        'min_data_in_leaf': 10,
+        'feature_fraction': 1.0,
+        'n_estimators': 50
+    }
+
+    if is_classification:
+        if len(unique_classes) > 2:  # More than 2 classes
+            return {**common_params,
+                    'objective': 'multiclass',
+                    'metric': 'multi_logloss'}, LGBMClassifier()
+        else:  # Binary classification
+            return {**common_params,
+                    'objective': 'binary',
+                    'metric': 'binary_logloss'}, LGBMClassifier()
+    else:
+        return {**common_params,
+                'objective': 'regression',
+                'metric': 'rmse'}, LGBMRegressor()
+
+
+def iterative_feature_selection(X_train, y_train, is_classification, core_features=None, tscv = False):
+    # Perform stratified split
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_train,
+        y_train,
+        test_size=0.25,
+        random_state=42,
+        stratify=y_train,
+        shuffle= not tscv
+    )
+
+    # Check unique classes in training set
+    if is_classification:
+        unique_classes = np.unique(y_train)
+        if len(unique_classes) <= 1:
+            raise ValueError("Training data must contain more than one class for classification.")
+        print("Unique classes in training set:", unique_classes)
+
+    # Initial model with core features
+    X_train_core = X_train[core_features]
+    X_val_core = X_val[core_features]
+
+    # Create parameter grid and model
+    params_grid, model = create_param_grid(is_classification, unique_classes)
+
+    # Fit the model with the parameters set during initialization
+    model.fit(X_train_core, y_train)
+
+    # Evaluate initial model on validation set
+    initial_score = evaluate_model(model, X_train_core, y_train, X_val_core, y_val, is_classification)
+    print(f'Initial Score with Core Features on Validation Set: {initial_score:.2f}')
+
+    # Test additional features
+    additional_features = [col for col in X_train.columns if col not in core_features]
+    best_score = initial_score
+    improved_features = []
+
+    for feature in additional_features:
+        print(f'Trying {feature}')
+        X_train_new = X_train_core.join(X_train[feature])
+        model_new = model.__class__(**params_grid)  # Create a new model with the same params
+        new_score = evaluate_model(model_new, X_train_new, y_train, X_val_core.join(X_val[feature]), y_val,
+                                   is_classification)
+
+        print(f'Score with {feature} added: {new_score:.2f}')
+
+        if new_score > best_score if is_classification else new_score < best_score:
+            improved_features.append(feature)
+            best_score = new_score
+
+    print(f'Features that improved performance: {improved_features}')
+    return model, best_score, improved_features, initial_score
+
+def lgb_feature_importance(best_model, plot = False):
+    # Plot feature importance for the best model
+    feature_names = best_model.feature_name_
+    importance = best_model.feature_importances_
+    feature_importance_df = pd.DataFrame({'Feature': feature_names, 'Importance': importance})
+    feature_importance_df = feature_importance_df.sort_values(by='Importance', ascending=False)
+
+    if plot:
+        # Plotting
+        plt.figure(figsize=(10, 6))
+        plt.barh(feature_importance_df['Feature'], feature_importance_df['Importance'], color='skyblue')
+        plt.xlabel('Importance')
+        plt.title('Feature Importance for Best Model')
+        plt.gca().invert_yaxis()  # Reverse the y-axis
+        plt.show()
+
+    return feature_importance_df
