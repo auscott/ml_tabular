@@ -2,7 +2,7 @@
 
 ## 🚀 Overview
 
-Welcome to the **Tabular Data Analysis Project**! This initiative is designed to demonstrate a comprehensive and sophisticated approach to analyzing tabular data, particularly focusing on datasets from Kaggle. The goal is to leverage advanced data science techniques to derive actionable insights and build predictive models that can solve real-world problems.
+Welcome to the **Tabular Data Analysis Project**! This initiative is designed to demonstrate a comprehensive and sophisticated approach to analyzing tabular data, particularly focusing on datasets with enterprise use cases. The goal is to leverage advanced data science techniques to derive actionable insights and build predictive models that can solve real-world problems.
 
 ### 🎯 Project Objectives
 
