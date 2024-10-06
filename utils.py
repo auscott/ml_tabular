@@ -4,6 +4,7 @@ from sklearn.preprocessing import StandardScaler  # or MinMaxScaler
 from scipy import stats
 import pandas as pd
 import numpy as np
+from itertools import product
 from sklearn.model_selection import train_test_split, GridSearchCV, cross_val_score, TimeSeriesSplit
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.linear_model import LogisticRegression, LinearRegression, Lasso
@@ -19,7 +20,10 @@ from sklearn.pipeline import make_pipeline
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.metrics import roc_curve, auc
-
+from joblib import Parallel, delayed
+from sklearn.pipeline import Pipeline
+from sklearn.base import BaseEstimator, TransformerMixin
+import gc
 
 # Detailed and Quick parameter grids for classification
 models_classification = {
@@ -570,6 +574,9 @@ def encode_categorical_features(X_train, X_test, one_hot_cols, target_encode_col
 
     return X_train, X_test
 
+def ts_get_feature(data, non_feature_core = ['Date']):
+    return [c for c in data.columns if c not in non_feature_core]
+
 
 def train_baseline_model(X_train, y_train, is_classification=True, l1_param=1.0):
     """
@@ -584,6 +591,7 @@ def train_baseline_model(X_train, y_train, is_classification=True, l1_param=1.0)
     Returns:
     - model: Trained model
     """
+
     if is_classification:
         if l1_param > 0:
             model = LogisticRegression(penalty='l1', C=1 / l1_param, solver='liblinear')
@@ -605,12 +613,19 @@ def train_baseline_model(X_train, y_train, is_classification=True, l1_param=1.0)
 
 def baseline_coefficient(pipeline):
     # Access the model coefficients
-    if isinstance(pipeline.named_steps['logisticregression'], LogisticRegression):
+    # Check for the presence of models in the pipeline
+    if 'logisticregression' in pipeline.named_steps:
         model = pipeline.named_steps['logisticregression']
-    elif isinstance(pipeline.named_steps['lasso'], Lasso):
+        if isinstance(model, LogisticRegression):
+            print("Logistic Regression model found.")
+    elif 'lasso' in pipeline.named_steps:
         model = pipeline.named_steps['lasso']
-    else:
+        if isinstance(model, Lasso):
+            print("Lasso model found.")
+    elif 'linearregression' in pipeline.named_steps:
         model = pipeline.named_steps['linearregression']
+        if isinstance(model, LinearRegression):
+            print("LinearRegression model found.")
 
     # Get coefficients
     coefficients = model.coef_
@@ -717,11 +732,18 @@ def evaluate_baseline_model(model, X_train, y_train, X_test, y_test, is_classifi
 
     return train_metric, test_metric
 
-def check_overfitting(train_metric, test_metric, ratio = 1.1):
-    if train_metric > test_metric * ratio:  # Adjust the threshold as needed
-        print("Warning: Possible overfitting detected!")
+def check_overfitting(train_metric, test_metric, ratio = 1.1, is_classfication = False):
+    if is_classfication:
+        if train_metric > test_metric * ratio:  # Adjust the threshold as needed
+            print("Warning: Possible overfitting detected!")
+        else:
+            print("Model performance is consistent between training and test sets.")
     else:
-        print("Model performance is consistent between training and test sets.")
+        if train_metric < test_metric * ratio:  # Adjust the threshold as needed
+            print("Warning: Possible overfitting detected!")
+        else:
+            print("Model performance is consistent between training and test sets.")
+
 
 
 # Custom logging function for GridSearchCV
@@ -730,14 +752,185 @@ def log_loss_function(y_true, y_pred):
     print(f"Current Loss: {loss:.4f}")
     return loss
 
+def ts_train_test_split(X, y, test_size =0.2, random_state = 42, date_column = 'date', join_cols = None):
+    join_cols = [date_column] if join_cols is None else join_cols + [date_column]
+    data = pd.merge(X, y, on=join_cols, how='inner')
+    assert ((len(data) == len(X)) & (len(data) == len(y))), 'joined data is not in right form'
+
+    unique_dates = data[date_column].drop_duplicates()
+    train_dates, test_dates, _, _ = (
+        train_test_split(unique_dates, unique_dates, test_size=test_size, random_state= random_state, shuffle=False))
+
+    X_train, X_test, y_train, y_test = \
+        (data.loc[data[date_column].isin(train_dates), X.columns],
+         data.loc[data[date_column].isin(test_dates), X.columns],
+         data.loc[data[date_column].isin(train_dates), y.columns],
+         data.loc[data[date_column].isin(test_dates), y.columns])
+    return X_train, X_test, y_train, y_test
+
+
+def ts_split(data, n_splits, date_column = 'date'):
+    unique_dates = data[date_column].drop_duplicates()
+    tscv = TimeSeriesSplit(n_splits = n_splits)
+
+    for train_date_index, test_date_index in tscv.split(unique_dates):
+        train_date = unique_dates[train_date_index]
+        test_date = unique_dates[test_date_index]
+        train = data[data[date_column].isin(train_date)]
+        test = data[data[date_column].isin(test_date)]
+        yield train, test
+
+def tscv_multi_index(data, n_splits, date_column='date'):
+    unique_dates = data[date_column].drop_duplicates().values
+    tscv = TimeSeriesSplit(n_splits=n_splits)
+
+    for train_date_index, test_date_index in tscv.split(unique_dates):
+        train_dates = unique_dates[train_date_index]
+        test_dates = unique_dates[test_date_index]
+
+        train_index = data[data[date_column].isin(train_dates)].index
+        test_index = data[data[date_column].isin(test_dates)].index
+
+        # Debugging prints
+        print("Train Dates:", train_dates)
+        print("Test Dates:", test_dates)
+        print("Train Index:", train_index)
+        print("Test Index:", test_index)
+
+        # Ensure indices are not empty
+        if train_index.empty or test_index.empty:
+            print("Warning: Empty train or test index.")
+            continue
+
+        yield train_index, test_index
+
+# Custom cross-validator
+class TSCV_multi:
+    def __init__(self, n_splits, date_column = 'Date'):
+        self.n_splits = n_splits
+        self.date_column = date_column
+
+    def split(self, X, y=None, groups=None):
+        for train_index, test_index in tscv_multi_index(X, self.n_splits, self.date_column):
+            yield train_index, test_index
+
+    def get_n_splits(self, X=None, y=None, groups=None):
+        return self.n_splits
+
+class FeatureSelector(BaseEstimator, TransformerMixin):
+    def __init__(self, feature_cols):
+        self.feature_cols = feature_cols
+
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X):
+        return X[self.feature_cols]
+
+
+def create_pipeline_param_grid(model_name, param_options):
+    """Generate a parameter grid for GridSearchCV."""
+    param_grid = {}
+
+    for param, values in param_options.items():
+        # Prefix the parameter with the model name
+        param_grid[f'{model_name}__{param}'] = values
+
+    return param_grid
+
+class ts_GridSearchCV:
+    def __init__(self, model_class, param_grid, n_splits = 3, is_classification = False,
+                 date_column = 'date', join_cols=None, feature_cols=None, target_column=None, n_jobs = 3):
+        self.model_class = model_class
+        self.param_grid = param_grid
+        self.n_splits = n_splits
+        self.best_params_ = None
+        self.best_score_ = float('inf')
+        self.is_classification = is_classification
+        self.best_estimator_ = None
+        self.join_cols = join_cols
+        self.date_column = date_column
+        self.feature_cols = feature_cols
+        self.target_column = target_column
+        self.n_jobs = n_jobs
+
+
+    def instantiate_model(self):
+        if self.is_classification:
+            return models_classification[self.model_class][0]
+        else:
+            return models_classification[self.model_class][0]
+
+    def fit(self, X, y):
+        join_cols = [self.date_column] if self.join_cols is None else self.join_cols + [self.date_column]
+        data = pd.merge(X, y, on=join_cols, how='inner')
+        assert ((len(data) == len(X)) & (len(data) == len(y))), 'joined data is not in right form'
+
+        ts_splits = list(ts_split(data, self.n_splits, self.date_column))
+        param_combinations = list(product(*self.param_grid.values()))
+
+        batch_size = 5  # Number of parameter combinations to evaluate at once
+
+        def evaluate_model(params, train_test_splits):
+            param_dict = dict(zip(self.param_grid.keys(), params))
+            model = self.instantiate_model()
+            model.set_params(**param_dict)
+            scores = []
+
+            for train, test in train_test_splits:
+                X_train = train[self.feature_cols].copy()
+                y_train = train[self.target_column].copy()
+                X_test = test[self.feature_cols].copy()
+                y_test = test[self.target_column].copy()
+
+                model.fit(X_train, y_train)
+                y_pred = model.predict(X_test)
+
+                # Calculate score
+                if self.is_classification:
+                    score = -mean_squared_error(y_test, y_pred)  # Assuming you want to maximize
+                else:
+                    score = roc_auc_score(y_test, y_pred)
+                scores.append(score)
+
+            return np.mean(scores), param_dict, model
+
+        results = []
+
+        # Batch processing
+        for i in range(0, len(param_combinations), batch_size):
+            batch_results = Parallel(n_jobs=self.n_jobs)(
+                delayed(evaluate_model)(params, ts_splits) for params in param_combinations[i:i + batch_size]
+            )
+            results.extend(batch_results)
+
+            # Explicit garbage collection after each batch
+            gc.collect()
+
+        # Extract best results
+        for mean_score, param_dict, model in results:
+            if mean_score > self.best_score_:
+                self.best_score_ = mean_score
+                self.best_params_ = param_dict
+                self.best_estimator_ = model
+
+        return self
+
+
+    def predict(self, X):
+        if self.best_estimator is None:
+            raise RuntimeError("You must fit the model before calling predict.")
+
+        return self.best_estimator_.predict(X)
+
 
 # Step 3: Define and Optimize Ensemble Models with Two Hyperparameter Sets
 def optimize_model(model, param_grid, X_train, y_train, is_classification, tscv = False):
     if tscv:
-        cvs = TimeSeriesSplit(n_splits=3)
+        cv = TimeSeriesSplit(n_splits=3)
     else:
-        cvs = 3
-    grid_search = GridSearchCV(model, param_grid, cv=cvs,
+        cv = 3
+    grid_search = GridSearchCV(model, param_grid, cv=cv,
                                scoring='neg_mean_squared_error' if not is_classification else 'roc_auc', n_jobs=-1,
                                verbose=10)
     grid_search.fit(X_train, y_train)
@@ -745,7 +938,10 @@ def optimize_model(model, param_grid, X_train, y_train, is_classification, tscv 
 
 
 # Function to optimize models with a specified hyperparameter set
-def optimize_all_models(models, param_set, X_train, y_train, is_classification, tscv = False):
+def optimize_all_models(models, param_set, X_train, y_train, is_classification,
+                        tscv = True,
+                        date_column = None,
+                        feature_cols = None):
     best_models = {}
     for model_name, (model, params) in models.items():
         best_model, best_params = optimize_model(model, params[param_set], X_train, y_train, is_classification,
@@ -909,18 +1105,104 @@ def create_param_grid(is_classification, unique_classes):
                 'metric': 'rmse'}, LGBMRegressor()
 
 
-def iterative_feature_selection(X_train, y_train, is_classification, core_features=None, tscv = False):
+
+
+def reductive_feature_selection(X_train, y_train, is_classification, core_features=None, tscv=False,
+                                date_column = 'date', join_cols = None, feature_cols = None, target_column = None):
     # Perform stratified split
-    X_train, X_val, y_train, y_val = train_test_split(
-        X_train,
-        y_train,
-        test_size=0.25,
-        random_state=42,
-        stratify=y_train,
-        shuffle= not tscv
-    )
+    if tscv:
+        join_cols = [date_column] if join_cols is None else join_cols + [date_column]
+        X_train, X_val, y_train, y_val = \
+            ts_train_test_split(X_train, y_train, test_size=0.2, random_state=42,
+                                date_column=date_column, join_cols=join_cols)
+        X_train, X_val, y_train, y_val = \
+            (X_train[feature_cols], X_val[feature_cols], y_train[target_column], y_val[target_column])
+    else:
+        X_train, X_val, y_train, y_val = train_test_split(
+            X_train,
+            y_train,
+            test_size=0.25,
+            random_state=42,
+            stratify=y_train,
+        )
+
 
     # Check unique classes in training set
+    unique_classes = None
+    if is_classification:
+        unique_classes = np.unique(y_train)
+        if len(unique_classes) <= 1:
+            raise ValueError("Training data must contain more than one class for classification.")
+        print("Unique classes in training set:", unique_classes)
+
+    # If no core features are provided, initialize as empty
+    if core_features is None:
+        core_features = []
+
+    # Identify all features and initial features set
+    all_features = list(X_train.columns)
+    non_core_features = [f for f in all_features if f not in core_features]
+    initial_features = core_features + non_core_features
+
+    # Create parameter grid and model
+    params_grid, model = create_param_grid(is_classification, unique_classes)
+
+    # Fit the model with the initial features
+    model.fit(X_train[initial_features], y_train)
+
+    # Evaluate initial model on validation set
+    initial_score = evaluate_model(model, X_train[initial_features], y_train, X_val[initial_features], y_val,
+                                   is_classification)
+    print(f'Initial Score with Initial Features on Validation Set: {initial_score:.2f}')
+
+    # Prepare for feature removal
+    best_score = initial_score
+    features_to_keep = initial_features.copy()
+
+    # Iterate over non-core features to test removal
+    for feature in non_core_features:
+        print(f'Trying to drop {feature}')
+        new_features = [f for f in features_to_keep if f != feature]  # Drop the feature
+
+        # Fit model with the new feature set
+        model_new = model.__class__(**params_grid)  # Create a new model instance with the same params
+        new_score = evaluate_model(model_new, X_train[new_features], y_train, X_val[new_features], y_val,
+                                   is_classification)
+
+        print(f'Score after dropping {feature}: {new_score:.2f}')
+
+        # Check if the new score is worse
+        if (new_score < best_score and not is_classification) or (new_score > best_score and is_classification):
+            print(f'Dropping {feature} as it caused a score drop.')
+            features_to_keep.remove(feature)  # Keep the feature only if the score dropped
+        else:
+            print(f'Keeping {feature} as score did not drop.')
+
+    print(f'Final features selected: {features_to_keep}')
+    return model, best_score, features_to_keep, initial_score
+
+def progressive_feature_selection(X_train, y_train, is_classification, core_features=None, tscv = False,
+                                  date_column = 'date', join_cols = None, feature_cols = None, target_column = None):
+    # Perform stratified split
+    if tscv:
+        join_cols = [date_column] if join_cols is None else join_cols + [date_column]
+        X_train, X_val, y_train, y_val = \
+            ts_train_test_split(X_train, y_train, test_size=0.2, random_state=42,
+                                date_column=date_column, join_cols=join_cols)
+        X_train, X_val, y_train, y_val = \
+            (X_train[feature_cols], X_val[feature_cols], y_train[target_column], y_val[target_column])
+    else:
+        X_train, X_val, y_train, y_val = train_test_split(
+            X_train,
+            y_train,
+            test_size=0.25,
+            random_state=42,
+            stratify=y_train if is_classification else None,
+            shuffle= not tscv
+        )
+
+    # Check unique classes in training set
+    unique_classes = None
     if is_classification:
         unique_classes = np.unique(y_train)
         if len(unique_classes) <= 1:
